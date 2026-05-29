@@ -1,0 +1,36 @@
+services:
+  nexus-vault-redis:
+    image: redis:7-alpine
+    container_name: nexus-vault-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-vault-data:/data
+    networks:
+      - nexus-net
+      - default
+
+  fastapi:
+    build: .
+    container_name: nexus-brain
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - nexus-vault-redis
+    networks:
+      - nexus-net
+      - default
+    volumes:
+      - ./logs:/app/logs
+
+networks:
+  nexus-net:
+    external: true
+
+volumes:
+  redis-vault-data:
