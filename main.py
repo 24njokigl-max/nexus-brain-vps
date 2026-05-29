@@ -178,7 +178,14 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         await websocket.send_json({"fleet": LIVE_FLEET_DATA})
         while True:
-            await websocket.receive_text()
+            # 🚨 UPDATED: Active JSON parser for Ping/Pong Heartbeat
+            raw_data = await websocket.receive_text()
+            try:
+                json_data = json.loads(raw_data)
+                if json_data.get("action") == "ping":
+                    await websocket.send_json({"action": "pong"})
+            except json.JSONDecodeError:
+                pass # Ignore raw text that isn't valid JSON
     except WebSocketDisconnect:
         if websocket in active_connections:
             active_connections.remove(websocket)
@@ -799,7 +806,14 @@ async def sales_websocket_endpoint(websocket: WebSocket):
     try:
         await websocket.send_json({"sales_team": LIVE_SALES_DATA})
         while True:
-            await websocket.receive_text()
+            # 🚨 UPDATED: Active JSON parser for Ping/Pong Heartbeat
+            raw_data = await websocket.receive_text()
+            try:
+                json_data = json.loads(raw_data)
+                if json_data.get("action") == "ping":
+                    await websocket.send_json({"action": "pong"})
+            except json.JSONDecodeError:
+                pass
     except WebSocketDisconnect:
         if websocket in active_sales_connections:
             active_sales_connections.remove(websocket)
@@ -928,7 +942,14 @@ async def app_websocket_endpoint(websocket: WebSocket, email: str):
     mobile_app_connections[email] = websocket
     try:
         while True:
-            await websocket.receive_text()
+            # 🚨 UPDATED: Active JSON parser for Ping/Pong Heartbeat
+            raw_data = await websocket.receive_text()
+            try:
+                json_data = json.loads(raw_data)
+                if json_data.get("action") == "ping":
+                    await websocket.send_json({"action": "pong"})
+            except json.JSONDecodeError:
+                pass
     except WebSocketDisconnect:
         if email in mobile_app_connections:
             del mobile_app_connections[email]
