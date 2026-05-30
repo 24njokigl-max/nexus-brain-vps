@@ -818,6 +818,30 @@ async def sales_websocket_endpoint(websocket: WebSocket):
         if websocket in active_sales_connections:
             active_sales_connections.remove(websocket)
 
+
+_sid_cache: dict = {}
+
+async def verify_erp_session(sid: str):
+    import time as _t
+    cached = _sid_cache.get(sid)
+    if cached and cached["expires"] > _t.time():
+        return cached["email"]
+    try:
+        resp = await asyncio.to_thread(
+            requests.get,
+            f"{ERP_BASE_URL}/api/method/frappe.auth.get_logged_user",
+            headers={"Cookie": f"sid={sid}", "Accept": "application/json"},
+            timeout=5
+        )
+        if resp.status_code == 200:
+            email = resp.json().get("message", "")
+            if email and email != "Guest":
+                _sid_cache[sid] = {"email": email.lower(), "expires": _t.time() + 300}
+                return email.lower()
+    except Exception as e:
+        print(f"⚠️  ERP session verify failed: {e}")
+    return None
+
 @app.post("/telemetry/sales-ping")
 async def receive_sales_ping(
     payload: Dict = Body(...),
@@ -829,9 +853,9 @@ async def receive_sales_ping(
     if not erp_sid:
         return {"status": "error", "message": "Missing Authorization Session ID. Ping rejected."}
         
-    # CHANGED: Use redis_session to validate ERPNext session
-    session_keys = await redis_session.keys(f"*{erp_sid}*")
-    if not session_keys:
+    # Validate session via ERP HTTP (sessions are DB-backed, not Redis)
+    verified = await verify_erp_session(erp_sid)
+    if not verified:
         return {"status": "error", "message": "Invalid or Expired Session ID. Ghost ping rejected."}
 
     # 🚨 FIX: Force absolute lowercase to prevent UI Ghost Drops
