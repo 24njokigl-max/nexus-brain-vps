@@ -834,9 +834,11 @@ async def receive_sales_ping(
     if not session_keys:
         return {"status": "error", "message": "Invalid or Expired Session ID. Ghost ping rejected."}
 
-    sales_rep_email = payload.get("sales_rep") or payload.get("email")
+    # 🚨 FIX: Force absolute lowercase to prevent UI Ghost Drops
+    raw_email = payload.get("sales_rep") or payload.get("email")
+    sales_rep_email = raw_email.lower() if raw_email else "Unknown_Rep"
     
-    if not sales_rep_email or sales_rep_email == "Unknown_Rep":
+    if not sales_rep_email or sales_rep_email == "unknown_rep":
         return {"status": "error", "message": "Invalid or missing sales_rep email. Ghost ping rejected."}
 
     # 🚨 THE GRAVEYARD GUARD
@@ -1056,7 +1058,15 @@ async def get_sales_vault(
                 regions_raw = data.get("regions", [{"name": "Default Center"}])
                 order_history = data.get("order_history", [])
                 debt_snapshot = data.get("debt_snapshot", [])
-                dashboard_stats = data.get("dashboard_stats", {}) 
+                
+                # 🚨 FIX: Scaffold the dashboard_stats to prevent {} overwriting the React Native state
+                raw_stats = data.get("dashboard_stats", {})
+                dashboard_stats = {
+                    "sales_target": float(raw_stats.get("sales_target", 0.0)),
+                    "collection_target": float(raw_stats.get("collection_target", 0.0)),
+                    "mtd_sales": float(raw_stats.get("mtd_sales", 0.0)),
+                    "mtd_collections": float(raw_stats.get("mtd_collections", 0.0))
+                }
                 
                 # 🚨 METADATA ARRAYS FOR MOBILE DROPDOWNS
                 customer_groups_raw = data.get("customer_groups", [])
