@@ -837,20 +837,28 @@ async def verify_erp_session(sid: str):
     cached = _sid_cache.get(sid)
     if cached and cached["expires"] > _t.time():
         return cached["email"]
-    try:
-        resp = await asyncio.to_thread(
-            requests.get,
-            f"{ERP_BASE_URL}/api/method/frappe.auth.get_logged_user",
-            headers={"Cookie": f"sid={sid}", "Accept": "application/json"},
-            timeout=5
-        )
-        if resp.status_code == 200:
-            email = resp.json().get("message", "")
-            if email and email != "Guest":
-                _sid_cache[sid] = {"email": email.lower(), "expires": _t.time() + 300}
-                return email.lower()
-    except Exception as e:
-        print(f"⚠️  ERP session verify failed: {e}")
+
+    # 🚨 RETRY LOGIC: Attempt verification twice with a 500ms gap.
+    # On congested mobile networks (common in field conditions) the first
+    # request may time out even with a valid session. Two attempts covers
+    # transient failures without adding meaningful latency to happy path.
+    for attempt in range(2):
+        try:
+            resp = await asyncio.to_thread(
+                requests.get,
+                f"{ERP_BASE_URL}/api/method/frappe.auth.get_logged_user",
+                headers={"Cookie": f"sid={sid}", "Accept": "application/json"},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                email = resp.json().get("message", "")
+                if email and email != "Guest":
+                    _sid_cache[sid] = {"email": email.lower(), "expires": _t.time() + 300}
+                    return email.lower()
+        except Exception as e:
+            print(f"⚠️  ERP session verify failed (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                await asyncio.sleep(0.5)
     return None
 
 @app.post("/telemetry/sales-ping")
@@ -858,16 +866,33 @@ async def receive_sales_ping(
     payload: Dict = Body(...),
     erp_sid: str = Header(None, alias="erp-sid")
 ):
-    """Receives live GPS updates from the Native Nexus Sales App."""
-    
-    # 🚨 SECURE TELEMETRY VALIDATION
+    raw_email = payload.get("sales_rep") or payload.get("email")
+    ping_email = raw_email.lower() if raw_email else None
+
+    # 🚨 GRACE WINDOW CHECK: Allow pings through for 30 seconds after
+    # login even if SID is missing or not yet verified. This covers the
+    # race condition on slower Android devices (Tecno, Android 13) where
+    # the native service fires before the JS bridge has written the SID.
+    in_grace = False
+    if ping_email and ping_email in SALES_LOGIN_GRACE:
+        elapsed = time.time() - SALES_LOGIN_GRACE[ping_email]
+        if elapsed < 30.0:
+            in_grace = True
+        else:
+            del SALES_LOGIN_GRACE[ping_email]
+
     if not erp_sid:
-        return {"status": "error", "message": "Missing Authorization Session ID. Ping rejected."}
-        
-    # Validate session via ERP HTTP (sessions are DB-backed, not Redis)
-    verified = await verify_erp_session(erp_sid)
-    if not verified:
-        return {"status": "error", "message": "Invalid or Expired Session ID. Ghost ping rejected."}
+        if not in_grace:
+            return {"status": "error", "message": "Missing Authorization Session ID. Ping rejected."}
+        # Grace window: allow through but don't verify
+        verified = ping_email
+    else:
+        # Normal path: verify with retry
+        verified = await verify_erp_session(erp_sid)
+        if not verified:
+            if not in_grace:
+                return {"status": "error", "message": "Invalid or Expired Session ID. Ghost ping rejected."}
+            verified = ping_email
 
     # 🚨 FIX: Force absolute lowercase to prevent UI Ghost Drops
     raw_email = payload.get("sales_rep") or payload.get("email")
@@ -953,16 +978,21 @@ async def receive_sales_logout(payload: Dict = Body(...)):
         print(f"📡 Telemetry Purged & Blacklisted: {sales_rep_email} logged out.")
     return {"status": "purged"}
 
+# 🚨 Grace window registry: email -> timestamp of login
+# Pings arriving within 30s of login are allowed through even if SID
+# verification fails, to cover slow-device bridge timing gaps
+SALES_LOGIN_GRACE: dict = {}
+
 @app.post("/telemetry/sales-login")
 async def receive_sales_login(payload: Dict = Body(...)):
-    """
-    Clears the graveyard for an email. Used on fresh app login to allow
-    instant tracking even if they logged out seconds ago.
-    """
     sales_rep_email = payload.get("sales_rep")
-    if sales_rep_email in SALES_LOGOUT_GRAVEYARD:
-        del SALES_LOGOUT_GRAVEYARD[sales_rep_email]
-        print(f"🌅 Telemetry Resurrected: {sales_rep_email} cleared from graveyard.")
+    if sales_rep_email:
+        if sales_rep_email in SALES_LOGOUT_GRAVEYARD:
+            del SALES_LOGOUT_GRAVEYARD[sales_rep_email]
+            print(f"🌅 Telemetry Resurrected: {sales_rep_email} cleared from graveyard.")
+        # Seed the grace window so the first 30s of pings are never
+        # hard-rejected even if the SID hasn't propagated yet
+        SALES_LOGIN_GRACE[sales_rep_email] = time.time()
     return {"status": "resurrected"}
 
 # ────────────────────────────────────────────────
