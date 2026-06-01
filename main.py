@@ -128,14 +128,19 @@ async def geocode_worker():
 
 # 🚨 The Sales Heartbeat Worker
 async def sales_heartbeat_worker():
-    """
-    Continuously triggers the broadcast function every 2 seconds.
-    This ensures that if a rep's phone goes silent (app closed without logging out),
-    the Stale Guard will still evaluate them and push the 'Offline' state to the UI.
-    """
     print("💓 Nexus Sales Telemetry Heartbeat Initialized.")
     while True:
-        await broadcast_sales()
+        # 🚨 EFFICIENCY FIX: Only broadcast from the heartbeat if no pings
+        # have arrived in the last 3 seconds (i.e. all reps are offline).
+        # When reps are active, each ping already triggers broadcast_sales().
+        # This prevents doubling the WebSocket fan-out load during active hours.
+        current_time = time.time()
+        last_ping = max(
+            (v.get("last_updated", 0) for v in LIVE_SALES_DATA.values()),
+            default=0
+        )
+        if current_time - last_ping > 3:
+            await broadcast_sales()
         await asyncio.sleep(2)
 
 @app.on_event("startup")
