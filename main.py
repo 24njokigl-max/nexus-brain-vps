@@ -10,6 +10,8 @@ import random
 import hashlib 
 import pandas as pd
 import redis.asyncio as redis
+import firebase_admin
+from firebase_admin import credentials, messaging as fcm_messaging
 from io import BytesIO
 from collections import defaultdict
 from typing import List, Dict, Any, Optional 
@@ -29,6 +31,15 @@ load_dotenv()
 ORS_URL = os.getenv("ORS_URL", "http://nexus-ors:8082/ors")
 VROOM_URL = os.getenv("VROOM_URL", "http://nexus-vroom:3000")
 ERP_BASE_URL = os.getenv("ERP_BASE_URL", "https://erp.crystalapps.dev")
+
+# 🚨 FIREBASE ADMIN SDK INITIALIZATION (The FCM Bridge)
+# This requires the firebase_credentials.json file to be present in the same directory
+try:
+    cred = credentials.Certificate("firebase_credentials.json")
+    firebase_admin.initialize_app(cred)
+    print("🔥 Firebase Admin SDK Initialized Successfully.")
+except Exception as e:
+    print(f"⚠️ Firebase Admin SDK Failed to Initialize: {e}")
 
 # CHANGED: Two separate Redis connections
 # 1. Session Redis (connects to ERPNext's Redis cache for session validation)
@@ -983,31 +994,62 @@ async def app_websocket_endpoint(websocket: WebSocket, email: str):
 @app.post("/api/v1/cache/invalidate")
 async def invalidate_cache_and_notify(payload: Dict = Body(...)):
     """
-    🚨 Decoupled Cache Eviction & Broadcast Route
-    Clears targeted rep vaults from Redis Memory before notifying the active mobile apps.
+    🚨 THE HYBRID ROUTER: Decoupled Cache Eviction & Broadcast Route
+    1. Clears targeted rep vaults from Redis Memory.
+    2. Identifies active vs offline users.
+    3. Pushes 0-lag WebSockets to active screens.
+    4. Pushes High-Priority Headless FCM Messages to sleeping devices.
     """
     emails = payload.get("emails", [])
     command = payload.get("command", "FORCE_VAULT_SYNC")
+    tokens_dict = payload.get("fcm_tokens", {}) # 🚨 NEW: Dict of {email: [token1, token2]}
     
-    # CHANGED: Use redis_vault for vault cache operations
+    # 1. Clear Local Fast Cache
     for email in emails:
         cache_key = f"nexus:vault:{email}"
         await redis_vault.delete(cache_key)
         
-    # 2. Forward execution broadcast to active phone UI
     if "message" not in payload:
         payload["message"] = "Background Update Triggered"
         
-    notified = 0
+    notified_ws = 0
+    notified_fcm = 0
+    
+    # 2. The Traffic Router
     for email in emails:
+        # A. If the app is open on the screen, hit the zero-lag WebSocket
         if email in mobile_app_connections:
             try:
                 await mobile_app_connections[email].send_json(payload)
-                notified += 1
+                notified_ws += 1
             except Exception:
                 pass
+        
+        # B. If the app is closed, locked, or backgrounded, fire the Firebase Headless JS Engine
+        else:
+            user_tokens = tokens_dict.get(email, [])
+            if user_tokens:
+                try:
+                    # Construct a Data-Only message (No notification tray banner, pure background execution)
+                    message = fcm_messaging.MulticastMessage(
+                        data={
+                            "command": command,
+                            "doctype": payload.get("doctype", "System"),
+                            "silent_sync_flag": "true"
+                        },
+                        tokens=user_tokens,
+                        android=fcm_messaging.AndroidConfig(priority="high") # Ensures Android OS wakes up the process
+                    )
+                    
+                    # Push through Google Servers
+                    response = await asyncio.to_thread(fcm_messaging.send_multicast, message)
+                    notified_fcm += response.success_count
+                    print(f"🔥 FCM Push Success to {email}: {response.success_count} devices woken up.")
+                except Exception as e:
+                    print(f"⚠️ FCM Push Failed for {email}: {e}")
                 
-    return {"status": "success", "evicted_and_notified": notified}
+    return {"status": "success", "ws_pings": notified_ws, "fcm_pings": notified_fcm}
+
 
 @app.post("/telemetry/force-app-refresh")
 async def force_app_refresh(payload: Dict = Body(...)):

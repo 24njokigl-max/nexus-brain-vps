@@ -31,3 +31,6 @@ Thumbs.db
 
 # Docker
 *.pid
+
+# Firebase
+firebase_credentials.json
