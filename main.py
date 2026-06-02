@@ -1008,13 +1008,27 @@ mobile_app_connections: Dict[str, WebSocket] = {}
 @app.websocket("/telemetry/app-ws/{email}")
 async def app_websocket_endpoint(websocket: WebSocket, email: str):
     """
-    Dedicated WebSocket for the React Native App to listen for server commands
+    Dedicated WebSocket for the React Native App to listen for server commands.
+    🚨 FIX: Single-Device Concurrency Enforcement.
     """
     await websocket.accept()
+    
+    # 🚨 Kill Switch: If this user is already connected on another device, terminate the old session.
+    if email in mobile_app_connections:
+        try:
+            await mobile_app_connections[email].send_json({
+                "command": "FORCE_LOGOUT", 
+                "reason": "Security Alert: Your account was just logged in from a new device. This session has been terminated."
+            })
+            await mobile_app_connections[email].close()
+        except Exception:
+            pass
+            
     mobile_app_connections[email] = websocket
+    
     try:
         while True:
-            # 🚨 UPDATED: Active JSON parser for Ping/Pong Heartbeat
+            # Active JSON parser for Ping/Pong Heartbeat
             raw_data = await websocket.receive_text()
             try:
                 json_data = json.loads(raw_data)
@@ -1023,7 +1037,8 @@ async def app_websocket_endpoint(websocket: WebSocket, email: str):
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
-        if email in mobile_app_connections:
+        # Only delete the connection from RAM if the disconnecting socket is the currently active one
+        if mobile_app_connections.get(email) == websocket:
             del mobile_app_connections[email]
 
 @app.post("/api/v1/cache/invalidate")
