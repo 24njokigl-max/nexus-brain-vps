@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import re
 import math
@@ -11,10 +12,12 @@ import hashlib
 import pandas as pd
 import redis.asyncio as redis
 import firebase_admin
+import urllib.request
+import urllib.parse
 from firebase_admin import credentials, messaging as fcm_messaging
 from io import BytesIO
 from collections import defaultdict
-from typing import List, Dict, Any, Optional 
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from pydantic import BaseModel
 from fastapi import FastAPI, Body, WebSocket, WebSocketDisconnect, Header, Query 
@@ -33,7 +36,6 @@ VROOM_URL = os.getenv("VROOM_URL", "http://nexus-vroom:3000")
 ERP_BASE_URL = os.getenv("ERP_BASE_URL", "https://erp.crystalapps.dev")
 
 # 🚨 FIREBASE ADMIN SDK INITIALIZATION (The FCM Bridge)
-# This requires the firebase_credentials.json file to be present in the same directory
 try:
     cred = credentials.Certificate("firebase_credentials.json")
     firebase_admin.initialize_app(cred)
@@ -42,22 +44,17 @@ except Exception as e:
     print(f"⚠️ Firebase Admin SDK Failed to Initialize: {e}")
 
 # CHANGED: Two separate Redis connections
-# 1. Session Redis (connects to ERPNext's Redis cache for session validation)
 REDIS_SESSION_URL = os.getenv("REDIS_SESSION_URL", "redis://erpnext-redis-cache-1:6379/0")
-# 2. Vault Redis (dedicated cache for driver/sales vaults)
 REDIS_VAULT_URL = os.getenv("REDIS_VAULT_URL", "redis://localhost:6379/1")
 
-# CHANGED: Create two async Redis clients
 redis_session = redis.from_url(REDIS_SESSION_URL, decode_responses=True)
 redis_vault = redis.from_url(REDIS_VAULT_URL, decode_responses=True)
-
-# CHANGED: For backward compatibility, keep a single redis_client alias (points to vault)
 redis_client = redis_vault
 
 app = FastAPI(title="Nexus Brain API")
 
 # ────────────────────────────────────────────────
-# CORS Middleware
+# CORS Middleware & Proxies
 # ────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
@@ -67,9 +64,126 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🚨 CRITICAL: Trust Nginx Forwarding for Mobile WebSockets
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+
+# ────────────────────────────────────────────────
+# 🚨 ADVANCED GOOGLE MAPS EXTRACTION ENGINE
+# ────────────────────────────────────────────────
+def resolve_redirects(url: str) -> str:
+    """Follow HTTP 302 redirects and return the decoded final URL."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; Google-Maps-Resolver/2.0)"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        raw_url = response.geturl()
+    # Decode percent‑encoded characters once and for all
+    return urllib.parse.unquote(raw_url)
+
+def is_valid_coords(lat: float, lng: float) -> bool:
+    """True if lat/lng are within real geographic bounds."""
+    return (-90.0 <= lat <= 90.0) and (-180.0 <= lng <= 180.0)
+
+def extract_from_path(url: str) -> Optional[Tuple[float, float]]:
+    """Find a lat,lng pair embedded in the URL path."""
+    coord = r'[+-]?\d+(?:\.\d+)?'
+    pattern = re.compile(rf'/({coord}),({coord})(?=/|\?|$)')
+    for m in pattern.finditer(url):
+        try:
+            lat, lng = float(m.group(1)), float(m.group(2))
+            if is_valid_coords(lat, lng):
+                return lat, lng
+        except ValueError:
+            continue
+    return None
+
+def extract_at_latlng(url: str) -> Optional[Tuple[float, float]]:
+    """Extract from @lat,lng (pin URLs)."""
+    match = re.search(r'@([+-]?\d+(?:\.\d+)?),([+-]?\d+(?:\.\d+)?)', url)
+    if match:
+        try:
+            lat, lng = float(match.group(1)), float(match.group(2))
+            if is_valid_coords(lat, lng):
+                return lat, lng
+        except ValueError:
+            pass
+    return None
+
+def extract_3d4d(url: str) -> Optional[Tuple[float, float]]:
+    """Extract from !3d...!4d... (data parameter)."""
+    match = re.search(r'!3d([+-]?\d+(?:\.\d+)?)!4d([+-]?\d+(?:\.\d+)?)', url)
+    if match:
+        try:
+            lat, lng = float(match.group(1)), float(match.group(2))
+            if is_valid_coords(lat, lng):
+                return lat, lng
+        except ValueError:
+            pass
+    return None
+
+def extract_from_query(url: str) -> Optional[Tuple[float, float]]:
+    """Check the ?ll= parameter (already decoded by parse_qs)."""
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    if 'll' in qs:
+        parts = qs['ll'][0].split(',')
+        if len(parts) == 2:
+            try:
+                lat, lng = float(parts[0]), float(parts[1])
+                if is_valid_coords(lat, lng):
+                    return lat, lng
+            except ValueError:
+                pass
+    return None
+
+def extract_plus_code(url: str) -> Optional[Tuple[float, float]]:
+    """Decode a Plus Code if the optional library is installed."""
+    plus_match = re.search(
+        r'/([0-9A-Z]{8}\+[0-9A-Z]{2,3})(?:/|$|\?)',
+        url, re.IGNORECASE
+    )
+    if plus_match:
+        try:
+            import openlocationcode as olc
+            area = olc.decode(plus_match.group(1))
+            lat, lng = area.latitude_center, area.longitude_center
+            if is_valid_coords(lat, lng):
+                return lat, lng
+        except ImportError:
+            pass
+    return None
+
+def extract_coords_from_url(url: str) -> Optional[Tuple[float, float]]:
+    """Run all extraction strategies on the already decoded URL."""
+    result = extract_from_path(url)
+    if result: return result
+    result = extract_at_latlng(url)
+    if result: return result
+    result = extract_3d4d(url)
+    if result: return result
+    result = extract_from_query(url)
+    if result: return result
+    result = extract_plus_code(url)
+    if result: return result
+    return None
+
+def get_coordinates(input_url: str) -> Optional[Tuple[float, float]]:
+    """High‑level pipeline."""
+    if not input_url.startswith(('http://', 'https://')):
+        input_url = 'https://' + input_url
+    try:
+        final_url = resolve_redirects(input_url)
+    except Exception as e:
+        print(f"Error resolving URL: {e}", file=sys.stderr)
+        return None
+
+    coords = extract_coords_from_url(final_url)
+    return coords
+
 
 # ────────────────────────────────────────────────
 # THE ENTERPRISE BACKGROUND DAEMON (JITTER QUEUE)
@@ -79,7 +193,8 @@ GEOCODE_QUEUE = asyncio.Queue()
 async def geocode_worker():
     """
     Runs continuously in the background. Pulls Google Maps links from the queue,
-    extracts coordinates, updates ERPNext via callback, and sleeps (Jitter) to avoid IP bans.
+    extracts coordinates using the advanced multi-strategy engine, updates ERPNext via callback, 
+    and sleeps (Jitter) to avoid IP bans.
     """
     print("🤖 Nexus Background Geocoding Worker Initialized.")
     while True:
@@ -91,23 +206,24 @@ async def geocode_worker():
         erp_headers = task_data.get("erp_headers")  
 
         try:
-            # 1. Scrape the Google Maps URL
-            headers = {"User-Agent": "Mozilla/5.0"}
-            res = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
-            m = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', res.url) or re.search(r'center=(-?\d+\.\d+)%2C(-?\d+\.\d+)', res.text)
+            # 1. Advanced Coordinate Extraction (Delegated to thread to prevent async blocking)
+            coords = await asyncio.to_thread(get_coordinates, url)
 
-            if m:
-                lat, lng = float(m.group(1)), float(m.group(2))
+            if coords:
+                lat, lng = coords
                 status = "Success"
+                combined_coords = f"{lat},{lng}"
             else:
                 lat, lng = 0.0, 0.0
                 status = "Invalid Link"
+                combined_coords = ""
 
             # 2. Fire Callback to ERPNext to update the Customer record silently
             if erp_url and erp_headers and customer_name:
                 payload = {
                     "custom_latitude": lat,
                     "custom_longitude": lng,
+                    "custom_combined_coordinates": combined_coords,
                     "custom_geocoding_status": status
                 }
                 update_endpoint = f"{erp_url}/api/resource/Customer/{customer_name}"
@@ -590,7 +706,7 @@ async def extract_coords(payload: Dict = Body(...)):
     """
     Polymorphic Engine: 
     - Fast Path: Accepts direct lat/lng from mobile device payload to avoid scraping.
-    - Slow Path: Accepts a raw Google Maps URL from ERP desk environments and extracts via web scraping.
+    - Slow Path: Accepts a raw Google Maps URL and extracts the coordinates via the advanced multi-strategy engine.
     """
     url = payload.get("url")
     lat = payload.get("latitude") or payload.get("lat")
@@ -598,18 +714,29 @@ async def extract_coords(payload: Dict = Body(...)):
     
     # Fast Path (Pre-parsed by Mobile App Engine)
     if lat and lng:
-        return {"status": "success", "lat": float(lat), "lng": float(lng)}
+        return {
+            "status": "success", 
+            "lat": float(lat), 
+            "lng": float(lng),
+            "combined_coordinates": f"{float(lat)},{float(lng)}"
+        }
         
-    # Slow Path (ERPNext Backend Scraping Request)
+    # Slow Path (Backend Scraping Request)
     if not url: 
         return {"status": "error", "message": "No URL or coordinates provided"}
         
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
-        m = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', res.url) or re.search(r'center=(-?\d+\.\d+)%2C(-?\d+\.\d+)', res.text)
-        if m: 
-            return {"status": "success", "lat": float(m.group(1)), "lng": float(m.group(2))}
+        # Delegate blocking extraction pipeline to background thread
+        coords = await asyncio.to_thread(get_coordinates, url)
+        if coords: 
+            lat, lng = coords
+            return {
+                "status": "success", 
+                "lat": lat, 
+                "lng": lng,
+                "combined_coordinates": f"{lat},{lng}"
+            }
+            
         return {"status": "error", "message": "GPS coordinates not found in link redirect"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
